@@ -1,0 +1,240 @@
+(() => {
+  // ------------ helpers ------------
+  const wait = ms => new Promise(r => setTimeout(r, ms));
+  const phoneRx = /\+?\d[\d\s-]{6,}\d/;
+
+  const getGroupName = () =>
+    document.querySelector('header div[role="button"] span[dir="auto"]')?.innerText?.trim() ||
+    document.querySelector('header [title]')?.title?.trim() ||
+    document.querySelector('header span[title]')?.innerText?.trim() ||
+    'Unknown_Group_' + Date.now();
+
+  // find the list root
+  const findListRoot = () =>
+    document.querySelector('#app div[role="dialog"]') ||
+    document.querySelector('#app div[role="application"] [role="dialog"]') ||
+    document.querySelector('#app');
+
+  // find the *real* scroll container by walking up until something scrolls
+  const getScrollContainer = () => {
+    const root = findListRoot();
+    if (!root) return null;
+    // pick a child near the list; fallback to root
+    let el =
+      root.querySelector('div[role="grid"]') ||
+      root.querySelector('div[role="list"]') ||
+      root.querySelector('div[tabindex="-1"][aria-label]') ||
+      root;
+    // climb parents until scrollable
+    let cur = el;
+    for (let i = 0; i < 10 && cur; i++) {
+      const canScroll = cur.scrollHeight - cur.clientHeight > 40; // has overflow
+      const style = cur.ownerDocument.defaultView.getComputedStyle(cur);
+      const overflow = style.overflowY || style.overflow;
+      if (canScroll && (overflow === 'auto' || overflow === 'scroll' || cur === document.body)) {
+        return cur;
+      }
+      cur = cur.parentElement;
+    }
+    // last fallback: whichever has the biggest scrollHeight under root
+    let best = null, bestH = 0;
+    root.querySelectorAll('*').forEach(n => {
+      if (n.scrollHeight - n.clientHeight > bestH) { bestH = n.scrollHeight - n.clientHeight; best = n; }
+    });
+    return best || root;
+  };
+
+  const exportCSV = (rows, groupName) => {
+    const csv = ['Group,Name,Phone']
+      .concat(rows.map(r =>
+        `"${r.group.replace(/"/g,'""')}","${r.name.replace(/"/g,'""')}","${r.phone}"`
+      ))
+      .join('\n');
+    const blob = new Blob([csv], { type: 'text/csv' });
+    const a = Object.assign(document.createElement('a'), {
+      href: URL.createObjectURL(blob),
+      download: `whatsapp_${groupName.replace(/\W+/g,'_')}_members.csv`
+    });
+    a.click();
+    URL.revokeObjectURL(a.href);
+  };
+
+  const elapsedStr = (ms0) => {
+    const s = Math.floor((Date.now() - ms0)/1000);
+    return `${Math.floor(s/60)}m ${s%60}s`;
+  };
+
+  // ------------ state ------------
+  let SPEED = 2;                      // px per frame (adjustable 1–5)
+  let isPaused = false;
+  let isStopped = true;               // idle until Play
+  let seen = new Map();               // phone -> {group,name,phone}
+  let startTime = Date.now();
+  let pass = 0;
+  let lastTop = 0, stuck = 0;
+  let rafId = null;                   // rAF handle
+  let parseTimer = null;              // parsing interval
+  let scrollEl = null;                // real scroll container
+  let currentGroup = getGroupName();
+  let loopActive = false;             // prevent double-start
+
+  // ------------ overlay UI ------------
+  const box = document.createElement('div');
+  Object.assign(box.style, {
+    position:'fixed', top:'20px', right:'20px', zIndex:'999999',
+    background:'#000', color:'#00ff90', font:'13px monospace',
+    padding:'10px 14px', border:'1px solid #00ff90',
+    borderRadius:'10px', boxShadow:'0 0 10px #00ff90',
+    width:'360px', whiteSpace:'pre-line', lineHeight:'1.4em'
+  });
+  document.body.appendChild(box);
+
+  const mkBtn = (txt, bg, fn) => {
+    const b = document.createElement('button');
+    b.textContent = txt;
+    Object.assign(b.style, {
+      margin:'4px', background:bg, border:'none',
+      padding:'6px 10px', color:'#fff', borderRadius:'5px', cursor:'pointer'
+    });
+    b.onclick = fn;
+    return b;
+  };
+
+  const btnRow = document.createElement('div');
+  const pauseBtn = mkBtn('⏸ Pause', '#ff9800', () => { isPaused = true; });
+  const playBtn  = mkBtn('▶ Play',  '#4caf50', () => startOrResume());
+  const stopBtn  = mkBtn('⏹ Stop',  '#9e9e9e', () => stopAll(false));
+  const dlBtn    = mkBtn('⬇ Download', '#2196f3', () => exportCSV(Array.from(seen.values()), currentGroup));
+  btnRow.append(pauseBtn, playBtn, stopBtn, dlBtn);
+  box.appendChild(btnRow);
+
+  // speed slider
+  const speedWrap = document.createElement('div');
+  speedWrap.style.marginTop = '6px';
+  const lbl = document.createElement('div'); lbl.textContent = 'Scroll speed';
+  const slider = document.createElement('input');
+  slider.type='range'; slider.min='1'; slider.max='5'; slider.step='0.5'; slider.value=String(SPEED);
+  slider.style.width='100%';
+  const speedVal = document.createElement('div'); speedVal.textContent = `${SPEED}px/frame`;
+  slider.oninput = () => { SPEED = parseFloat(slider.value); speedVal.textContent = `${SPEED}px/frame`; };
+  speedWrap.append(lbl, slider, speedVal);
+  box.appendChild(speedWrap);
+
+  const status = document.createElement('div');
+  status.style.marginTop = '8px';
+  box.appendChild(status);
+
+  const headerText = (extra='') =>
+    `🪐 Group: ${currentGroup}\n` +
+    `⏱ Elapsed: ${elapsedStr(startTime)}\n` +
+    `📊 Total: ${seen.size}\n` +
+    `☑️ Cycles: ${pass}\n` +
+    `⚡ Speed: ${SPEED}px/frame${extra ? '\n'+extra : ''}`;
+
+  const setStatus = (extra='') => { status.textContent = headerText(extra); };
+
+  // ------------ session control ------------
+  const resetSession = () => {
+    seen = new Map();
+    startTime = Date.now();
+    pass = 0; stuck = 0; lastTop = 0;
+    setStatus('▶ Press Play to start');
+  };
+
+  const stopAll = (resetAlso=true) => {
+    isStopped = true; isPaused = false;
+    if (rafId) cancelAnimationFrame(rafId), rafId = null;
+    if (parseTimer) clearInterval(parseTimer), parseTimer = null;
+    loopActive = false;
+    if (resetAlso) resetSession();
+  };
+
+  const startOrResume = () => {
+    const nameNow = getGroupName();
+    // if stopped or group changed -> fresh start
+    if (isStopped || nameNow !== currentGroup) {
+      currentGroup = nameNow;
+      stopAll(true);
+    }
+    isStopped = false;
+    isPaused = false;
+
+    // reacquire real scroll element on every resume
+    scrollEl = getScrollContainer();
+    if (!scrollEl) {
+      setStatus('❗ Open "Search members" panel');
+      return;
+    }
+
+    // start parsing interval (captures visible rows every 150ms)
+    if (!parseTimer) {
+      parseTimer = setInterval(captureVisible, 150);
+    }
+
+    // start scroll rAF if not running
+    if (!loopActive) {
+      loopActive = true;
+      rAFScroll();
+    }
+  };
+
+  // ------------ capture & scroll ------------
+  function captureVisible() {
+    // The list items render inside the dialog; query under root to be robust
+    const root = findListRoot() || document;
+    root.querySelectorAll('div[role="listitem"]').forEach(row => {
+      const lines = row.innerText.split('\n').map(t => t.trim()).filter(Boolean);
+      if (!lines.length) return;
+      const number = lines.find(l => phoneRx.test(l));
+      const name   = lines.find(l => !phoneRx.test(l) && !/^You$/i.test(l));
+      if (number) {
+        const clean = number.replace(/\s|-/g,'');
+        if (!seen.has(clean)) {
+          seen.set(clean, { group: currentGroup, name: name || '', phone: clean });
+          setStatus(`👤 Last: ${name || '(no name)'} – ${clean}`);
+        }
+      }
+    });
+  }
+
+  function rAFScroll() {
+    if (isStopped) { loopActive = false; return; }
+
+    // If paused, just update timer and schedule next frame
+    if (isPaused) {
+      setStatus('⏸ Paused');
+      rafId = requestAnimationFrame(rAFScroll);
+      return;
+    }
+
+    // If DOM changed, reacquire scroll element
+    if (!scrollEl || !scrollEl.isConnected) {
+      scrollEl = getScrollContainer();
+      if (!scrollEl) {
+        setStatus('❗ Open "Search members" panel');
+        rafId = requestAnimationFrame(rAFScroll);
+        return;
+      }
+    }
+
+    // scroll by SPEED px (direct scrollTop for reliability)
+    scrollEl.scrollTop = (scrollEl.scrollTop || 0) + SPEED;
+    pass++;
+
+    // end detection
+    if (scrollEl.scrollTop === lastTop) stuck++; else { lastTop = scrollEl.scrollTop; stuck = 0; }
+    if (stuck > 400) {
+      setStatus('✅ Reached end');
+      loopActive = false;
+      return;
+    }
+
+    rafId = requestAnimationFrame(rAFScroll);
+  }
+
+  // initial state text
+  resetSession();
+
+  // OPTIONAL: auto-start immediately
+  // startOrResume();
+})();
